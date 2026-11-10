@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Read-only AI switch status page on :8099.
+
+  /        HTML page: overall state, per-provider state, AI news of the last 24h
+  /status  plain text "allowed" or "blocked"
+
+Both return 200 when AI is allowed and 503 when every provider (except "always")
+is blocked, so Homarr's ping dot follows the switch. Nothing here can change the switch.
+
+Reads only files in /var/lib/ai-switch-status, written by cron as pi:
+  status.txt  output of ai-status (every minute)
+  news.json   written by ai-news-watch (every 15 minutes)
+"""
+import html
+import json
+import os
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = 8099
+DIR = "/var/lib/ai-switch-status"
+STATUS = os.path.join(DIR, "status.txt")
+NEWS = os.path.join(DIR, "news.json")
+STALE_AFTER = 5 * 60  # status.txt is rewritten every minute
+
+
+def read_status():
+    """Returns (providers, info_line, age_seconds). providers: list of dicts per table row."""
+    try:
+        with open(STATUS) as f:
+            lines = f.read().splitlines()
+        age = time.time() - os.path.getmtime(STATUS)
+    except OSError:
+        return [], "", None
+    providers, info = [], ""
+    for i, line in enumerate(lines):
+        if line.startswith("provider"):
+            for row in lines[i + 1:]:
+                if not row.strip():
+                    break
+                cols = row.split(None, 4)
+                if len(cols) >= 4:
+                    providers.append({"name": cols[0], "switch": cols[1], "dns": cols[2],
+                                      "firewall": cols[3], "lists": cols[4] if len(cols) > 4 else ""})
+            rest = [l for l in lines[i + 1 + len(providers):] if l.strip()]
+            info = rest[0] if rest else ""
+            break
+    return providers, info, age
+
+
+def overall(providers):
+    switchable = [p for p in providers if p["switch"] != "always"]
+    blocked = [p for p in switchable if p["switch"] == "off"]
+    if switchable and len(blocked) == len(switchable):
+        return "blocked"
+    return "partly" if blocked else "allowed"
+
+
+def read_news():
+    try:
+        with open(NEWS) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def fmt_time(ts):
+    return time.strftime("%a %H:%M", time.localtime(ts))
+
+
+NAMES = {"claude": "Claude", "openai": "OpenAI", "xai": "xAI", "metaai": "Meta AI",
+         "huggingface": "Hugging Face", "deepseek": "DeepSeek", "copilot": "Copilot",
+         "gemini": "Gemini", "mistral": "Mistral", "cohere": "Cohere",
+         "perplexity": "Perplexity", "others": "Others"}
+
+CSS = """
+:root{--bg:#14161b;--card:#1e2128;--line:#2c3039;--text:#e8eaed;--muted:#9aa0a8;
+  --green:#34c37a;--orange:#f0a640;--red:#f0605a;--blue:#73a7f0}
+@media (prefers-color-scheme:light){:root{--bg:#f2f3f5;--card:#fff;--line:#e2e4e8;
+  --text:#1d2025;--muted:#646a73;--green:#1f9d5c;--orange:#c27a12;--red:#d13d36;--blue:#2f6fd0}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:17px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+.wrap{max-width:1100px;margin:0 auto;padding:24px 16px 40px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px 22px}
+.hero{display:flex;align-items:center;gap:20px;border-left:6px solid var(--state)}
+.big-dot{flex:none;width:28px;height:28px;border-radius:50%;background:var(--state);
+  box-shadow:0 0 0 8px color-mix(in srgb,var(--state) 20%,transparent)}
+.hero h1{margin:0;font-size:32px;line-height:1.2;color:var(--state)}
+.hero p{margin:4px 0 0;color:var(--muted)}
+.counts{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.chip{padding:3px 12px;border-radius:999px;font-size:14px;font-weight:600;
+  background:color-mix(in srgb,var(--c) 16%,transparent);color:var(--c)}
+.alert{margin-top:16px;border-left:6px solid var(--red);color:var(--text)}
+.alert b{color:var(--red)}
+.warn{margin-top:16px;border-left:6px solid var(--orange)}
+h2{font-size:20px;margin:32px 0 12px}
+h2 small{font-size:14px;font-weight:400;color:var(--muted);margin-left:8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
+.prov{padding:16px 18px;border-top:4px solid var(--c)}
+.prov .name{font-size:19px;font-weight:650}
+.pill{display:inline-block;margin:6px 0 8px;padding:2px 12px;border-radius:999px;font-size:14px;
+  font-weight:650;background:color-mix(in srgb,var(--c) 16%,transparent);color:var(--c)}
+.meta{color:var(--muted);font-size:14px;line-height:1.6}
+.news{display:flex;flex-direction:column;gap:12px}
+.item{display:block;text-decoration:none;color:inherit;transition:border-color .15s}
+.item:hover{border-color:var(--blue)}
+.item .title{font-size:18px;font-weight:600;color:var(--text);margin-top:6px}
+.item.fired{border-left:6px solid var(--red)}
+.tag{display:inline-block;padding:1px 10px;border-radius:999px;font-size:13px;font-weight:600;margin-right:6px;
+  background:color-mix(in srgb,var(--blue) 16%,transparent);color:var(--blue)}
+.tag.red{background:color-mix(in srgb,var(--red) 16%,transparent);color:var(--red)}
+.empty{color:var(--muted)}
+footer{margin-top:28px;color:var(--muted);font-size:14px}
+@media (max-width:600px){.hero h1{font-size:26px}.wrap{padding:16px}
+  .grid{grid-template-columns:1fr 1fr;gap:8px}.prov{padding:12px 14px}.prov .name{font-size:17px}}
+"""
+
+
+def page(providers, info, age, news):
+    state = overall(providers) if providers else "unknown"
+    color = {"allowed": "var(--green)", "partly": "var(--orange)", "blocked": "var(--red)",
+             "unknown": "var(--muted)"}[state]
+    label = {"allowed": "AI allowed", "partly": "AI partly blocked", "blocked": "AI blocked",
+             "unknown": "AI status unknown"}[state]
+    e = html.escape
+    sw = {"on": ("allowed", "var(--green)"), "off": ("blocked", "var(--red)"),
+          "always": ("always allowed", "var(--blue)")}
+    counts = {}
+    for p in providers:
+        counts[p["switch"]] = counts.get(p["switch"], 0) + 1
+
+    out = ['<!doctype html><html><head><meta charset="utf-8">'
+           '<meta name="viewport" content="width=device-width,initial-scale=1">'
+           '<meta http-equiv="refresh" content="30"><title>AI switch</title>'
+           '<style>%s</style></head><body><div class="wrap">' % CSS]
+
+    out.append('<div class="card hero" style="--state:%s"><div class="big-dot"></div><div>'
+               '<h1>%s</h1>' % (color, label))
+    if info:
+        out.append('<p>%s</p>' % e(info))
+    out.append('<div class="counts">')
+    for key in ("on", "off", "always"):
+        if counts.get(key):
+            out.append('<span class="chip" style="--c:%s">%d %s</span>' % (sw[key][1], counts[key], sw[key][0]))
+    out.append('</div></div></div>')
+
+    if age is not None and age > STALE_AFTER:
+        out.append('<div class="card warn">Status file is %d minutes old: the ai-status cron job may have '
+                   'stopped.</div>' % (age // 60))
+
+    fired_links = set()
+    for b in (news or {}).get("blocks", []):
+        fired_links.update(b.get("links", []))
+        result = "AI was blocked." if b.get("ok") else "ai-off FAILED, check the Pi."
+        out.append('<div class="card alert"><b>%s · Breach reported: %s</b><br>Reported by %s. %s</div>'
+                   % (e(fmt_time(b["ts"])), e(b["company"]), e(", ".join(b.get("sources", []))), result))
+
+    out.append('<h2>Providers</h2><div class="grid">')
+    for p in providers:
+        word, c = sw.get(p["switch"], (p["switch"], "var(--muted)"))
+        fw = "" if p["firewall"] == "-" else " · Firewall %s" % e(p["firewall"])
+        out.append('<div class="card prov" style="--c:%s"><div class="name">%s</div>'
+                   '<span class="pill">%s</span><div class="meta">DNS %s%s<br>%s</div></div>'
+                   % (c, e(NAMES.get(p["name"], p["name"])), e(word), e(p["dns"]), fw, e(p["lists"])))
+    out.append('</div>')
+
+    out.append('<h2>AI incident news<small>last 24 hours</small></h2>')
+    if news is None:
+        out.append('<div class="card empty">No data from ai-news-watch yet.</div>')
+    else:
+        items = news.get("matches", [])
+        if not items:
+            out.append('<div class="card empty">No matching headlines in the last 24 hours.</div>')
+        out.append('<div class="news">')
+        for m in items:
+            fired = m["link"] in fired_links
+            tags = "".join('<span class="tag%s">%s</span>' % (" red" if fired else "", e(c))
+                           for c in m["companies"])
+            inner = ('<div class="meta">%s%s · %s</div><div class="title">%s</div>'
+                     % (tags, e(fmt_time(m["ts"])), e(m["source"]), e(m["title"])))
+            if m["link"].startswith(("https://", "http://")):
+                out.append('<a class="card item%s" href="%s" target="_blank" rel="noopener noreferrer">%s</a>'
+                           % (" fired" if fired else "", e(m["link"]), inner))
+            else:
+                out.append('<div class="card item%s">%s</div>' % (" fired" if fired else "", inner))
+        out.append('</div>')
+        out.append('<footer>News last checked %s · %d of %d feeds reachable · page refreshes every 30 s'
+                   '</footer>' % (e(fmt_time(news["checked"])), news.get("feeds_ok", 0),
+                                  news.get("feeds_total", 0)))
+    out.append('</div></body></html>')
+    return "".join(out)
+
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        providers, info, age = read_status()
+        code = 503 if providers and overall(providers) == "blocked" else 200
+        if self.path == "/status":
+            body, ctype = ("blocked" if code == 503 else "allowed"), "text/plain; charset=utf-8"
+        elif self.path in ("/", "/index.html"):
+            body, ctype = page(providers, info, age, read_news()), "text/html; charset=utf-8"
+        else:
+            body, ctype, code = "not found", "text/plain; charset=utf-8", 404
+        data = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):
+        pass  # Homarr pings constantly; don't fill the journal
+
+
+if __name__ == "__main__":
+    ThreadingHTTPServer(("", PORT), Handler).serve_forever()

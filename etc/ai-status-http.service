@@ -1,0 +1,15 @@
+# Install as /etc/systemd/system/ai-status-http.service
+[Unit]
+Description=Read-only AI switch status page
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/ai-status-http
+DynamicUser=yes
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

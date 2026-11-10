@@ -1,0 +1,789 @@
+#!/usr/bin/env python3
+"""ai-switch: network kill switch for AI platforms on OpenWrt + AdGuard Home.
+
+Runs on the Pi. Install as /usr/local/bin/ai-switch and symlink the ai-* names
+to it; the name you call it by decides what it does:
+
+  ai-off / ai-on [provider ...]   block / unblock (every provider when none given)
+  ai-status                       what is blocked, plus the latest route report
+  ai-update                       daily job: refresh lists and report route changes
+  ai-idle                         every few minutes: block everything after IDLE_HOURS without AI traffic
+  ai-whitelist [provider ...]     show the whitelist, or add providers that are never blocked
+  ai-unwhitelist provider ...     take providers off the whitelist
+
+Block lists live in ~/.config/ai-switch/providers/<name>/:
+  domains  one domain per line (subdomains included); lines starting with / | @ are raw AdGuard rules
+  ranges   IP ranges the router firewall rejects
+  hosts    hostnames whose routes are tracked daily
+Create a new folder there to add a provider of your own.
+
+Network settings can be overridden in ~/.config/ai-switch/config (KEY=value lines):
+  ROUTER=192.168.1.1                 router that runs AdGuard Home and nftables (reached as root over SSH)
+  AGH=http://192.168.1.1:8080        AdGuard Home URL
+  IDLE_IGNORE_CLIENTS=192.168.1.50   comma-separated IPs whose AI lookups never count as activity
+  IDLE_HOURS=2
+  MAX_ON_HOURS=8
+AdGuard credentials go in ~/.config/ai-switch/agh-auth as user:password (chmod 600).
+"""
+import base64
+import http.client
+import ipaddress
+import json
+import re
+import socket
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+CONF = Path.home() / ".config/ai-switch"
+
+
+def _config():
+    cfg = {}
+    try:
+        for line in (CONF / "config").read_text().splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"')
+    except OSError:
+        pass
+    return cfg
+
+
+_CFG = _config()
+ROUTER = _CFG.get("ROUTER", "192.168.1.1")
+AGH = _CFG.get("AGH", f"http://{ROUTER}:8080")
+DOH = "https://1.1.1.1/dns-query"  # by IP, so lookups still work if DoH hostnames get blocked
+NFT_TABLE = "ai_kill"
+WATCH_LIMIT = 40  # hostnames tracked per provider
+MAX_ON_HOURS = float(_CFG.get("MAX_ON_HOURS", 8))  # hard cap: block everything this long after the last ai-on, whatever the traffic
+IDLE_IGNORE_DOMAINS = ["a-api.anthropic.com", "a-cdn.anthropic.com", "downloads.claude.ai",
+                       "statsig.anthropic.com"]  # telemetry/updaters: not a person using AI
+# Machines that run AI agents (e.g. Claude Code): their own traffic must not keep AI on
+IDLE_IGNORE_CLIENTS = [c.strip() for c in _CFG.get("IDLE_IGNORE_CLIENTS", "").split(",") if c.strip()]
+IDLE_HOURS = float(_CFG.get("IDLE_HOURS", 2))    # block every provider after this long without AI traffic on the network
+LOG_PAGES = 10    # x 1000 AdGuard query log entries scanned per update
+UA = "Mozilla/5.0 (X11; Linux x86_64) ai-switch"
+# Certificate log checks per run. Free without a key is only a handful of lookups an hour,
+# so domains are checked in rotation; with a key in ~/.config/ai-switch/certspotter-key all are checked.
+CT_PER_RUN_NO_KEY = 4
+# CDN/cloud infrastructure names that turn up on shared certificates; never an AI domain.
+INFRA = ("cloudflaressl.com", "cloudflare.com", "cloudflare.net", "amazonaws.com", "cloudfront.net",
+         "azureedge.net", "azurefd.net", "akamaiedge.net", "fastly.net", "googleusercontent.com")
+
+# Starting lists. After the first run the files under CONF are the source of truth.
+#   auto:   new domains containing these words are blocked automatically
+#   review: new domains containing these words are only listed for you to check
+#   asn:    network owner names that mean "this IP range belongs to the provider itself"
+#   pages:  web apps whose security headers (CSP) list the domains they talk to
+PROVIDERS = {
+    "claude": {
+        "domains": ["anthropic.com", "claude.ai", "claude.com", "claudeusercontent.com"],
+        "ranges": ["160.79.104.0/21", "2607:6bc0::/48"],
+        "hosts": ["api.anthropic.com", "claude.ai", "console.anthropic.com"],
+        "auto": ["anthropic"], "review": ["claude"], "asn": ["ANTHROPIC"],
+        "ip_page": "https://docs.anthropic.com/en/api/ip-addresses",
+        "pages": ["https://claude.ai/login"],
+    },
+    "openai": {
+        "domains": ["openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com", "sora.com",
+                    "openai.azure.com"],
+        "hosts": ["api.openai.com", "chatgpt.com", "cdn.oaistatic.com"],
+        "auto": ["openai", "chatgpt"], "asn": ["OPENAI"],
+        "pages": ["https://chatgpt.com/", "https://platform.openai.com/"],
+    },
+    "gemini": {
+        "domains": ["gemini.google.com", "gemini.google", "aistudio.google.com", "bard.google.com",
+                    "makersuite.google.com", "notebooklm.google.com", "notebooklm.google",
+                    "generativelanguage.googleapis.com", "aiplatform.googleapis.com",
+                    r"/^[a-z0-9-]+-aiplatform\.googleapis\.com$/$important"],
+        "hosts": ["generativelanguage.googleapis.com", "gemini.google.com", "aistudio.google.com"],
+        "auto": ["generativelanguage"], "review": ["gemini", "bard", "notebooklm"],
+        "pages": ["https://gemini.google.com/", "https://aistudio.google.com/"],
+    },
+    "deepseek": {
+        "domains": ["deepseek.com"],
+        "hosts": ["api.deepseek.com", "chat.deepseek.com"],
+        "auto": ["deepseek"],
+        "pages": ["https://chat.deepseek.com/", "https://platform.deepseek.com/"],
+    },
+    "copilot": {
+        "domains": ["copilot.microsoft.com", "githubcopilot.com", "copilot-proxy.githubusercontent.com",
+                    "sydney.bing.com"],
+        "hosts": ["copilot.microsoft.com", "api.githubcopilot.com"],
+        "review": ["copilot"],
+        "pages": ["https://copilot.microsoft.com/"],
+    },
+    "mistral": {
+        "domains": ["mistral.ai"],
+        "hosts": ["api.mistral.ai", "chat.mistral.ai"],
+        "review": ["mistral"],
+        "pages": ["https://chat.mistral.ai/"],
+    },
+    "xai": {
+        "domains": ["x.ai", "grok.com"],
+        "hosts": ["api.x.ai", "grok.com"],
+        "review": ["grok"],
+        "pages": ["https://grok.com/"],
+    },
+    "perplexity": {
+        "domains": ["perplexity.ai", "pplx.ai"],
+        "hosts": ["api.perplexity.ai", "www.perplexity.ai"],
+        "auto": ["perplexity"],
+        "pages": ["https://www.perplexity.ai/"],
+    },
+    "metaai": {
+        "domains": ["meta.ai"],
+        "hosts": ["www.meta.ai"],
+        "pages": ["https://www.meta.ai/"],
+    },
+    "cohere": {
+        "domains": ["cohere.com", "cohere.ai"],
+        "hosts": ["api.cohere.com"],
+        "review": ["cohere"],
+        "pages": ["https://dashboard.cohere.com/"],
+    },
+    "huggingface": {
+        "domains": ["huggingface.co", "hf.co"],
+        "hosts": ["huggingface.co", "router.huggingface.co"],
+        "auto": ["huggingface"],
+        "pages": ["https://huggingface.co/chat/"],
+    },
+    "others": {
+        "domains": ["character.ai", "poe.com", "openrouter.ai", "groq.com", "together.ai", "together.xyz",
+                    "qwen.ai", "dashscope.aliyuncs.com", "kimi.com", "moonshot.cn", "moonshot.ai",
+                    "bigmodel.cn", "z.ai"],
+        "hosts": ["api.groq.com", "openrouter.ai", "api.together.xyz", "poe.com", "character.ai",
+                  "chat.qwen.ai"],
+        "auto": ["openrouter"], "review": ["qwen", "kimi"],
+        "pages": ["https://openrouter.ai/", "https://poe.com/", "https://chat.qwen.ai/"],
+    },
+}
+
+
+def log(msg):
+    print(f"{datetime.now():%Y-%m-%d %H:%M} {msg}", flush=True)
+
+
+def read_list(path):
+    if not path.exists():
+        return []
+    return [l.strip() for l in path.read_text().splitlines() if l.strip() and not l.startswith("#")]
+
+
+def write_list(path, items):
+    path.write_text("".join(f"{i}\n" for i in dict.fromkeys(items)))
+
+
+def pdir(name):
+    return CONF / "providers" / name
+
+
+def providers():
+    return sorted(p.name for p in (CONF / "providers").iterdir() if p.is_dir())
+
+
+def meta(name):
+    return PROVIDERS.get(name, {})
+
+
+def is_raw(entry):
+    return entry[0] in "/|@"
+
+
+def whitelist():
+    """Providers that are never blocked: not by ai-off, not by the idle rule."""
+    return read_list(CONF / "whitelist")
+
+
+def plain_domains(name):
+    return [d for d in read_list(pdir(name) / "domains") if not is_raw(d)]
+
+
+def rules_for(name):
+    return [d if is_raw(d) else f"||{d}^$important" for d in read_list(pdir(name) / "domains")]
+
+
+def nets_for(name):
+    nets = []
+    for r in read_list(pdir(name) / "ranges"):
+        try:
+            nets.append(ipaddress.ip_network(r, strict=False))
+        except ValueError:
+            log(f"[{name}] ignoring invalid range {r!r}")
+    return nets
+
+
+def covered(host, domains):
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def load_json(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def init():
+    (CONF / "providers").mkdir(parents=True, exist_ok=True)
+    for name, p in PROVIDERS.items():
+        d = pdir(name)
+        if d.exists():
+            continue
+        d.mkdir()
+        write_list(d / "domains", p["domains"])
+        write_list(d / "ranges", p.get("ranges", []))
+        write_list(d / "hosts", p["hosts"])
+    if not (CONF / "state.json").exists():
+        (CONF / "state.json").write_text("{}")
+
+
+# --- router and AdGuard -------------------------------------------------------
+
+def agh(path, body=None):
+    auth = base64.b64encode((CONF / "agh-auth").read_text().strip().encode()).decode()
+    req = urllib.request.Request(
+        AGH + path, data=None if body is None else json.dumps(body).encode(),
+        headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = r.read()
+    try:
+        return json.loads(data)
+    except ValueError:
+        return None
+
+
+def ssh(cmd, stdin=None):
+    return subprocess.run(["ssh", f"root@{ROUTER}", cmd], input=stdin, text=True, capture_output=True)
+
+
+def apply():
+    """Make AdGuard and the router firewall match state.json."""
+    state = load_json(CONF / "state.json")
+    names = providers()
+    off = [n for n in names if state.get(n) == "off" and n not in whitelist()]
+
+    ours = set(read_list(CONF / "applied"))
+    ours |= {r for n in names for r in rules_for(n)}
+    wanted = list(dict.fromkeys(r for n in off for r in rules_for(n)))
+    current = (agh("/control/filtering/status") or {}).get("user_rules") or []
+    agh("/control/filtering/set_rules", {"rules": [r for r in current if r not in ours] + wanted})
+    write_list(CONF / "applied", wanted)
+
+    # "table X; delete table X" is idempotent: it works whether or not the table exists.
+    nft = [f"table inet {NFT_TABLE}", f"delete table inet {NFT_TABLE}"]
+    ranges = list(dict.fromkeys(str(net) for n in off for net in nets_for(n)))
+    if ranges:
+        nft += [f"table inet {NFT_TABLE} {{", "  chain ai_block {",
+                "    type filter hook forward priority -5; policy accept;"]
+        nft += [f"    {'ip6' if ':' in r else 'ip'} daddr {r} counter reject" for r in ranges]
+        nft += ["  }", "}"]
+    res = ssh("nft -f -", "\n".join(nft) + "\n")
+    if res.returncode:
+        sys.exit(f"router firewall update failed: {res.stderr.strip()}")
+
+
+def set_switch(targets, value):
+    state = load_json(CONF / "state.json")
+    for t in targets:
+        state[t] = value
+    (CONF / "state.json").write_text(json.dumps(state, indent=1))
+    apply()
+    if value == "on":  # switching on starts a fresh idle countdown
+        idle_state = load_json(CONF / "idle.json")
+        idle_state["last_ai"] = idle_state["on_since"] = datetime.now(timezone.utc).isoformat()
+        (CONF / "idle.json").write_text(json.dumps(idle_state))
+    print(f"{value.upper()}: {', '.join(targets)}")
+
+
+def status():
+    state = load_json(CONF / "state.json")
+    rules = set((agh("/control/filtering/status") or {}).get("user_rules") or [])
+    fw = ssh(f"nft list table inet {NFT_TABLE}").stdout
+    print(f"{'provider':12} {'switch':7} {'DNS':8} {'firewall':9} lists")
+    for n in providers():
+        r, nets = rules_for(n), nets_for(n)
+        dns = "blocked" if r and all(x in rules for x in r) else "open"
+        fws = "-" if not nets else "blocked" if all(str(x) in fw for x in nets) else "open"
+        switch = "always" if n in whitelist() else state.get(n, "on")
+        print(f"{n:12} {switch:7} {dns:8} {fws:9} {len(r)} domains, {len(nets)} ranges")
+    if any(state.get(n) != "off" for n in providers()):
+        last = load_json(CONF / "idle.json").get("last_ai")
+        if last:
+            deadline = parse_time(last) + timedelta(hours=IDLE_HOURS)
+            mins = max(0, int((deadline - datetime.now(timezone.utc)).total_seconds() // 60))
+            print(f"\nLast AI traffic {parse_time(last).astimezone():%H:%M}; everything is blocked in {mins} min "
+                  f"without more ({IDLE_HOURS:g}h idle rule)")
+    suggestions = read_list(CONF / "suggestions")
+    if suggestions:
+        print("\nPossible AI domains to review (add to providers/<name>/domains to block):")
+        for s in suggestions:
+            print(f"  {s}")
+    if (CONF / "report.txt").exists():
+        print("\n" + (CONF / "report.txt").read_text().rstrip())
+
+
+# --- daily update -------------------------------------------------------------
+
+class _PinnedHTTPS(http.client.HTTPSConnection):
+    """HTTPS to a hostname at an IP we resolved ourselves (certificate still checked for the name)."""
+
+    def __init__(self, host, ip, **kw):
+        super().__init__(host, **kw)
+        self._ip = ip
+
+    def connect(self):
+        sock = socket.create_connection((self._ip, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+def fetch(url, limit=20_000_000, headers=None, timeout=90):
+    """GET a URL, resolving names via DoH so it works while AdGuard blocks them. Returns (headers, body)."""
+    for _ in range(5):
+        u = urllib.parse.urlsplit(url)
+        ips = [a["data"] for a in doh(u.hostname, "A") if a.get("type") == 1]
+        if not ips:
+            raise OSError(f"{u.hostname} does not resolve")
+        conn = _PinnedHTTPS(u.hostname, ips[0], timeout=timeout)
+        try:
+            conn.request("GET", (u.path or "/") + (f"?{u.query}" if u.query else ""),
+                         headers={"User-Agent": UA, "Accept": "text/html,application/json,*/*", **(headers or {})})
+            r = conn.getresponse()
+            if r.status in (301, 302, 303, 307, 308) and r.getheader("Location"):
+                url = urllib.parse.urljoin(url, r.getheader("Location"))
+                continue
+            return r.headers, r.read(limit)
+        finally:
+            conn.close()
+    raise OSError(f"too many redirects for {url}")
+
+
+def page_hosts(url):
+    """Hostnames a web app declares in its CSP headers and references in its HTML."""
+    headers, body = fetch(url, limit=3_000_000)
+    text = " ".join((headers.get_all("Content-Security-Policy") or [])
+                    + (headers.get_all("Content-Security-Policy-Report-Only") or []))
+    text += " " + body.decode("utf-8", "replace")
+    found = set(re.findall(r"(?:https?|wss?)://(?:\*\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)", text, re.I))
+    found |= set(re.findall(r"(?<![\w.-])\*\.([a-z0-9-]+(?:\.[a-z0-9-]+)+)", text, re.I))
+    return {h.lower() for h in found if re.search(r"[a-z]", h.rsplit(".", 1)[-1], re.I)}
+
+
+class RateLimited(Exception):
+    pass
+
+
+def ct_names(domain, after=""):
+    """SAN lists of certificates issued for a domain and its subdomains since `after`.
+
+    Returns (list of name sets, new `after`, rate_limited). Uses Cert Spotter, which can
+    fetch only what is new since the last run; when Cert Spotter is down (not merely
+    over quota) falls back to crt.sh (everything still valid).
+    """
+    certs = []
+    key_file = CONF / "certspotter-key"
+    auth = {"Authorization": f"Bearer {key_file.read_text().strip()}"} if key_file.exists() else {}
+    try:
+        for _ in range(20):
+            q = {"domain": domain, "include_subdomains": "true", "expand": "dns_names"}
+            if after:
+                q["after"] = after
+            page = json.loads(fetch(f"https://api.certspotter.com/v1/issuances?{urllib.parse.urlencode(q)}",
+                                    headers=auth)[1])
+            if isinstance(page, dict) and page.get("code") == "rate_limited":
+                return certs, after, True  # keep what we got; the rest waits for the next run
+            if not isinstance(page, list):
+                raise OSError(page)
+            if not page:
+                break
+            certs += [{n.lower().lstrip("*.") for n in c.get("dns_names", [])} for c in page]
+            after = page[-1]["id"]
+        return certs, after, False
+    except Exception as e:
+        log(f"Cert Spotter failed for {domain} ({str(e)[:80]}), trying crt.sh")
+    q = urllib.parse.urlencode({"q": f"%.{domain}", "output": "json", "exclude": "expired", "deduplicate": "Y"})
+    rows = json.loads(fetch(f"https://crt.sh/?{q}", timeout=30)[1])
+    return certs + [{n.strip().lower().lstrip("*.") for n in c.get("name_value", "").split("\n") if n.strip()}
+                    for c in rows], after, False
+
+
+def fetch_ranges(url):
+    html = fetch(url)[1].decode("utf-8", "replace")
+    nets = []
+    for m in set(re.findall(r"[0-9a-fA-F:.]+/\d{1,3}", html)):
+        try:
+            net = ipaddress.ip_network(m, strict=False)
+        except ValueError:
+            continue
+        # Real network blocks only: skip single egress hosts (/32, /128) and anything absurdly wide.
+        if net.is_global and (12 <= net.prefixlen <= 24 if net.version == 4 else 24 <= net.prefixlen <= 64):
+            nets.append(net)
+    return nets
+
+
+def query_log():
+    entries, older_than = [], ""
+    for _ in range(LOG_PAGES):
+        page = agh(f"/control/querylog?limit=1000&older_than={older_than}") or {}
+        entries += page.get("data") or []
+        older_than = page.get("oldest", "")
+        if not page.get("data") or not older_than:
+            break
+    return entries
+
+
+def doh(name, rtype):
+    url = f"{DOH}?{urllib.parse.urlencode({'name': name, 'type': rtype})}"
+    req = urllib.request.Request(url, headers={"Accept": "application/dns-json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.load(r).get("Answer") or []
+
+
+def txt(name):
+    return [a["data"].replace('"', "") for a in doh(name, "TXT") if a.get("type") == 16]
+
+
+_asn_names = {}
+_exists = {}
+
+
+def exists(host):
+    """True if the name is in public DNS; drops internal names and junk scraped from pages."""
+    if host not in _exists:
+        try:
+            _exists[host] = any(a.get("type") in (1, 5, 28) for t in ("A", "AAAA") for a in doh(host, t))
+        except Exception:
+            _exists[host] = True  # lookup failed: can't tell, so don't drop it
+    return _exists[host]
+
+
+def origin(ip):
+    """(announced prefix, 'AS1234 OWNER') for an IP, via Team Cymru's DNS service."""
+    rev = ipaddress.ip_address(ip).reverse_pointer
+    q = rev.replace(".in-addr.arpa", ".origin.asn.cymru.com").replace(".ip6.arpa", ".origin6.asn.cymru.com")
+    rows = txt(q)
+    if not rows:
+        return None
+    asn, prefix = [f.strip() for f in rows[0].split("|")[:2]]
+    asn = asn.split()[0]
+    if asn not in _asn_names:
+        names = txt(f"AS{asn}.asn.cymru.com")
+        _asn_names[asn] = f"AS{asn} " + (names[0].split("|")[-1].strip() if names else "?")
+    return prefix, _asn_names[asn]
+
+
+def trace(host):
+    """Where a hostname currently points: CNAME chain and the networks serving it."""
+    try:
+        cname, ips = set(), set()
+        for rtype in ("A", "AAAA"):
+            for a in doh(host, rtype):
+                if a.get("type") == 5:
+                    cname.add(a["data"].rstrip(".").lower())
+                elif a.get("type") in (1, 28):
+                    ips.add(a["data"])
+        prefixes = {}
+        for ip in sorted(ips):
+            o = origin(ip)
+            if o:
+                prefixes[o[0]] = o[1]
+        return {"cname": sorted(cname), "prefixes": prefixes}
+    except Exception as e:
+        log(f"lookup failed for {host}: {e}")
+        return None
+
+
+def update():
+    report = []
+
+    def note(line):
+        report.append(line)
+        log(line)
+
+    names = providers()
+    nets = {n: nets_for(n) for n in names}
+    doms = {n: plain_domains(n) for n in names}
+    hosts = {n: read_list(pdir(n) / "hosts") for n in names}
+    suggestions = read_list(CONF / "suggestions")
+
+    # 1. Officially published IP ranges
+    for n in names:
+        url = meta(n).get("ip_page")
+        if not url:
+            continue
+        try:
+            for net in fetch_ranges(url):
+                if not any(net.subnet_of(c) for c in nets[n] if c.version == net.version):
+                    note(f"[{n}] new published IP range {net}: added to firewall block")
+                    nets[n].append(net)
+        except Exception as e:
+            log(f"[{n}] could not fetch published IP ranges: {e}")
+
+    def track(n, host):
+        if host not in hosts[n] and len(hosts[n]) < WATCH_LIMIT:
+            hosts[n].append(host)
+
+    def consider(host, source, ips=(), hint=None, watch=True):
+        """Block, list for review, or ignore a hostname found by one of the scans."""
+        host = host.rstrip(".").lower()
+        if "." not in host:
+            return
+        owner = next((n for n in names if covered(host, doms[n])), None)
+        if owner:
+            if watch:
+                track(owner, host)
+            return
+        if not exists(host):
+            return
+        hit = next((n for n in names if any(ip in net for ip in ips for net in nets[n])), None)
+        reason = f"resolves into its IP range, {source}"
+        if not hit:
+            hit = next((n for n in names if any(k in host for k in meta(n).get("auto", []))), None)
+            reason = f"name match, {source}"
+        if hit:
+            note(f"[{hit}] new domain {host} ({reason}): added to DNS block")
+            doms[hit].append(host)
+            track(hit, host)
+            return
+        rev = next((n for n in names if any(k in host for k in meta(n).get("review", []))), hint)
+        if rev and not any(s.split()[1] == host for s in suggestions):
+            note(f"[{rev}] possible domain {host} ({source}): listed for review, not blocked")
+            suggestions.append(f"{rev} {host} ({source})")
+
+    # 2. Domains seen on your network (AdGuard query log)
+    try:
+        entries = query_log()
+    except Exception as e:
+        log(f"could not read AdGuard query log: {e}")
+        entries = []
+    for entry in entries:
+        ips = []
+        for a in entry.get("answer") or []:
+            try:
+                ips.append(ipaddress.ip_address(a.get("value", "")))
+            except ValueError:
+                pass
+        consider((entry.get("question") or {}).get("name", ""), "seen on your network", ips)
+
+    # 3. Domains the AI web apps declare they talk to
+    for n in names:
+        for url in meta(n).get("pages", []):
+            try:
+                for host in page_hosts(url):
+                    consider(host, f"used by {urllib.parse.urlsplit(url).hostname}")
+            except Exception as e:
+                log(f"[{n}] could not scan {url}: {e}")
+
+    # 4. Certificate Transparency logs: new subdomains, and sister domains on the same certificate
+    ct_seen = load_json(CONF / "ct_seen.json")
+    # Least recently checked first, so a run cut short by the quota continues where it stopped.
+    todo = sorted(((n, d) for n in names for d in doms[n]), key=lambda nd: ct_seen.get(nd[1], {}).get("checked", ""))
+    if not (CONF / "certspotter-key").exists():
+        todo = todo[:CT_PER_RUN_NO_KEY]
+    for n, d in todo:
+        known = ct_seen.get(d, {})
+        try:
+            certs, after, limited = ct_names(d, known.get("after", ""))
+        except Exception as e:
+            log(f"[{n}] certificate log lookup failed for {d}: {e}")
+            continue
+        seen, fresh = set(known.get("names", [])), set()
+        for sans in certs:
+            for name in sans:
+                if covered(name, [d]):
+                    if name not in seen:
+                        fresh.add(name)
+                # Big shared certificates (Google, Microsoft) and CDN names say nothing about ownership.
+                elif len(sans) <= 10 and not covered(name, INFRA):
+                    consider(name, f"shares a certificate with {d}", hint=n, watch=False)
+        if "checked" in known and fresh:
+            shown = ", ".join(sorted(fresh)[:8]) + (" ..." if len(fresh) > 8 else "")
+            note(f"[{n}] {len(fresh)} new hostnames under {d} in certificate logs (already blocked): {shown}")
+            for name in fresh:
+                if name.split(".")[0].startswith("api"):
+                    track(n, name)
+        if limited:  # partial: keep progress but leave "checked" alone so this domain goes first next run
+            ct_seen[d] = {**known, "names": sorted(seen | fresh), "after": after}
+        else:
+            ct_seen[d] = {"names": sorted(seen | fresh), "after": after, "checked": f"{datetime.now():%Y-%m-%d %H:%M}"}
+        (CONF / "ct_seen.json").write_text(json.dumps(ct_seen))
+        if limited:
+            log(f"Cert Spotter quota reached at {d}; the remaining domains are checked on the next run")
+            break
+
+    # 5. Route changes
+    old_snap = load_json(CONF / "routes.json")
+    snap = json.loads(json.dumps(old_snap))
+    jobs = [(n, h) for n in names for h in hosts[n]]
+    with ThreadPoolExecutor(8) as ex:
+        results = list(ex.map(lambda job: trace(job[1]), jobs))
+    for (n, h), r in zip(jobs, results):
+        if r is None:
+            continue
+        old = old_snap.get(n, {}).get(h)
+        snap.setdefault(n, {})[h] = r
+        if old and old_snap:
+            old_as, new_as = set(old["prefixes"].values()), set(r["prefixes"].values())
+            if not new_as and old_as:
+                note(f"[{n}] {h} no longer resolves (was {', '.join(sorted(old_as))})")
+            elif new_as != old_as:
+                note(f"[{n}] {h} moved networks: {', '.join(sorted(old_as)) or 'none'} -> {', '.join(sorted(new_as))}")
+            if r["cname"] != old["cname"]:
+                note(f"[{n}] {h} now points via {', '.join(r['cname']) or 'no CNAME'} "
+                     f"(was {', '.join(old['cname']) or 'no CNAME'})")
+        elif old_snap:
+            note(f"[{n}] now tracking {h}: {', '.join(sorted(set(r['prefixes'].values()))) or 'no address'}")
+        # Ranges owned by the provider itself can be firewalled without hurting other sites.
+        owners = meta(n).get("asn", [])
+        for prefix, asn in r["prefixes"].items():
+            if not owners or not any(o in asn.upper() for o in owners):
+                continue
+            if old and prefix in old["prefixes"]:
+                continue
+            net = ipaddress.ip_network(prefix)
+            if not any(net.subnet_of(c) for c in nets[n] if c.version == net.version):
+                note(f"[{n}] {h} uses {prefix} owned by {asn}: consider adding it to {pdir(n) / 'ranges'}")
+    if not old_snap:
+        note(f"baseline recorded for {len(jobs)} hostnames; changes are reported from the next run")
+
+    for n in names:
+        raw = [d for d in read_list(pdir(n) / "domains") if is_raw(d)]
+        write_list(pdir(n) / "domains", doms[n] + raw)
+        write_list(pdir(n) / "ranges", [str(x) for x in nets[n]])
+        write_list(pdir(n) / "hosts", hosts[n])
+    write_list(CONF / "suggestions",
+               [s for s in suggestions if not any(covered(s.split()[1], d) for d in doms.values())])
+    (CONF / "routes.json").write_text(json.dumps(snap, indent=1, sort_keys=True))
+
+    stamp = f"{datetime.now():%Y-%m-%d %H:%M}"
+    body = "\n".join(f"  {l}" for l in report) if report else "  no changes"
+    (CONF / "report.txt").write_text(f"Last update {stamp}:\n{body}\n")
+    if report:
+        with open(CONF / "changes.log", "a") as f:
+            f.write("".join(f"{stamp} {l}\n" for l in report))
+
+    # Re-apply so switched-off providers pick up new entries (and survive a router reboot).
+    if "off" in load_json(CONF / "state.json").values():
+        apply()
+
+
+def parse_time(t):
+    """AdGuard timestamps carry nanoseconds; Python takes at most microseconds."""
+    return datetime.fromisoformat(re.sub(r"(\.\d{6})\d+", r"\1", t).replace("Z", "+00:00"))
+
+
+def idle():
+    """Block every provider when nothing on the network has used an unblocked one for IDLE_HOURS."""
+    state = load_json(CONF / "state.json")
+    names = providers()
+    names = [n for n in names if n not in whitelist()]
+    on = [n for n in names if state.get(n) != "off"]
+    if not on:
+        return
+    idle_state = load_json(CONF / "idle.json")
+    now = datetime.now(timezone.utc)
+    window = timedelta(hours=IDLE_HOURS)
+    since = parse_time(idle_state["last_check"]) if "last_check" in idle_state else now - window
+    last_ai = parse_time(idle_state["last_ai"]) if "last_ai" in idle_state else now  # first run: full grace period
+
+    # Read the query log back to the previous check, newest first.
+    doms = [d for n in on for d in plain_domains(n)]
+    older_than = ""
+    for _ in range(LOG_PAGES):
+        page = agh(f"/control/querylog?limit=1000&older_than={older_than}") or {}
+        data = page.get("data") or []
+        reached = False
+        for entry in data:
+            t = parse_time(entry["time"])
+            if t <= since:
+                reached = True
+                break
+            host = (entry.get("question") or {}).get("name", "").rstrip(".").lower()
+            # Telemetry/updater lookups and machines that run AI agents don't count as someone using AI.
+            # VPN clients routed through the switch host show up with that host's address.
+            # The script's own lookups go over DoH, so they never show up here.
+            if (covered(host, doms) and not covered(host, IDLE_IGNORE_DOMAINS)
+                    and entry.get("client") not in IDLE_IGNORE_CLIENTS):
+                last_ai = max(last_ai, t)
+        if reached or not data or not page.get("oldest"):
+            break
+        older_than = page["oldest"]
+
+    idle_state.setdefault("on_since", now.isoformat())
+    idle_state.update(last_check=now.isoformat(), last_ai=last_ai.isoformat())
+    (CONF / "idle.json").write_text(json.dumps(idle_state))
+    if now - parse_time(idle_state["on_since"]) >= timedelta(hours=MAX_ON_HOURS):
+        log(f"AI on for {MAX_ON_HOURS:g}h since the last ai-on: blocking all AI except the whitelist")
+        set_switch(names, "off")
+        return
+    if now - last_ai >= window:
+        log(f"no AI traffic since {last_ai.astimezone():%Y-%m-%d %H:%M}: blocking all AI except the whitelist")
+        set_switch(names, "off")
+
+
+def set_whitelist(targets, add):
+    current = whitelist()
+    if add:
+        write_list(CONF / "whitelist", current + targets)
+        state = load_json(CONF / "state.json")
+        for t in targets:
+            state[t] = "on"
+        (CONF / "state.json").write_text(json.dumps(state, indent=1))
+        apply()
+    else:
+        write_list(CONF / "whitelist", [n for n in current if n not in targets])
+    print(f"whitelist (never blocked): {', '.join(whitelist()) or 'empty'}")
+
+
+def usage():
+    sys.exit("usage: ai-on|ai-off [provider ...], ai-status, ai-update, ai-idle, "
+             "ai-whitelist [provider ...], ai-unwhitelist provider ...\n"
+             f"providers: {', '.join(providers())}")
+
+
+def main():
+    init()
+    prog, args = Path(sys.argv[0]).name, sys.argv[1:]
+    m = re.fullmatch(r"ai-(on|off|status|update|idle|whitelist|unwhitelist)", prog)
+    if m:
+        cmd, targets = m.group(1), args
+    elif args:
+        cmd, targets = args[0], args[1:]
+    else:
+        usage()
+    names = providers()
+    unknown = [t for t in targets if t not in names]
+    if unknown:
+        sys.exit(f"unknown provider: {', '.join(unknown)}\nproviders: {', '.join(names)}")
+    if cmd in ("on", "off"):
+        if cmd == "off":
+            listed = [t for t in targets if t in whitelist()]
+            if listed:
+                sys.exit(f"{', '.join(listed)} is on the whitelist and is never blocked; "
+                         f"use ai-unwhitelist {' '.join(listed)} first")
+            targets = targets or [n for n in names if n not in whitelist()]
+        set_switch(targets or names, cmd)
+    elif cmd == "whitelist":
+        set_whitelist(targets, add=True) if targets else print(
+            f"whitelist (never blocked): {', '.join(whitelist()) or 'empty'}")
+    elif cmd == "unwhitelist":
+        if not targets:
+            usage()
+        set_whitelist(targets, add=False)
+    elif cmd == "status":
+        status()
+    elif cmd == "update":
+        update()
+    elif cmd == "idle":
+        idle()
+    else:
+        usage()
+
+
+if __name__ == "__main__":
+    main()

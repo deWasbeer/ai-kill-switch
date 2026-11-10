@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""Blocks AI on the home network when several IT news sites report an AI breach.
+
+Runs from cron on the Pi as user pi. It reads the RSS/Atom feeds below and, when
+at least MIN_SOURCES different sites publish a matching headline about the same
+AI company within WINDOW_HOURS, runs `ai-off` and sends a Gotify alert.
+
+It can only turn AI off. Turning it back on stays manual: log in to the Pi, run ai-on.
+
+Usage:
+  ai-news-watch              normal run (cron)
+  ai-news-watch --dry-run    show matches, don't block or notify
+  ai-news-watch --test-alert send a test Gotify message only
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+
+MIN_SOURCES = 3
+MIN_SOURCES_GENERAL = 5  # "AI (general)" headlines are common in opinion pieces, so need more
+WINDOW_HOURS = 3
+COOLDOWN_HOURS = 24  # don't fire again for the same company within this time
+
+FEEDS = {
+    "BleepingComputer": "https://www.bleepingcomputer.com/feed/",
+    "The Record": "https://therecord.media/feed",
+    "The Hacker News": "https://feeds.feedburner.com/TheHackersNews",
+    "Ars Technica": "https://arstechnica.com/security/feed/",
+    "The Register": "https://www.theregister.com/security/headlines.atom",
+    "SecurityWeek": "https://www.securityweek.com/feed/",
+    "Dark Reading": "https://www.darkreading.com/rss.xml",
+    "TechCrunch": "https://techcrunch.com/category/security/feed/",
+    "Wired": "https://www.wired.com/feed/category/security/latest/rss",
+}
+
+# Headlines are grouped by company, so two sites only count together when they
+# report on the same one.
+COMPANIES = {
+    "OpenAI": r"openai|chatgpt|sora",
+    "Anthropic": r"anthropic|claude",
+    "Google AI": r"gemini|deepmind",
+    "Meta AI": r"meta ai|llama",
+    "Microsoft AI": r"copilot",
+    "xAI": r"xai|grok",
+    "Mistral": r"mistral",
+    "DeepSeek": r"deepseek",
+    "Hugging Face": r"hugging ?face",
+    "Perplexity": r"perplexity",
+    "AI (general)": r"ai agents?|ai models?|ai systems?|llms?|frontier models?",
+}
+INCIDENT = r"breach\w*|hacked|compromised?|leak(s|ed)?|exfiltrat\w*|rogue|escaped?|self-replicat\w*|model weights|unauthori[sz]ed access"
+# Criminals abusing a brand name (fake apps, phishing) is not a breach of the AI company
+EXCLUDE = r"fake|phishing|scam\w*|impersonat\w*|malicious (app|extension)s?|malware"
+
+COMPANY_RE = {name: re.compile(r"\b(?:%s)\b" % rx, re.I) for name, rx in COMPANIES.items()}
+INCIDENT_RE = re.compile(r"\b(?:%s)\b" % INCIDENT, re.I)
+EXCLUDE_RE = re.compile(r"\b(?:%s)\b" % EXCLUDE, re.I)
+
+HOME = os.path.expanduser("~")
+CONFIG = os.path.join(HOME, ".config/ai-news-watch/config")
+STATE = os.path.join(HOME, ".local/state/ai-news-watch/state.json")
+LOG = os.path.join(HOME, ".local/state/ai-news-watch/log.txt")
+# Read by the status page (ai-status-http), which can't see the home folder
+NEWS_JSON = "/var/lib/ai-switch-status/news.json"
+
+
+def log(msg):
+    line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+    print(line)
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(line + "\n")
+
+
+def load_config():
+    cfg = {"AI_OFF": "ai-off"}
+    if os.path.exists(CONFIG):
+        with open(CONFIG) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip().strip('"')
+    return cfg
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"matches": {}, "fired": {}, "feeds_down_warned": 0}
+
+
+def save_state(state):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE + ".tmp", "w") as f:
+        json.dump(state, f, indent=1)
+    os.replace(STATE + ".tmp", STATE)
+
+
+def parse_time(text):
+    if not text:
+        return None
+    text = text.strip()
+    try:
+        return parsedate_to_datetime(text).timestamp()  # RSS
+    except (TypeError, ValueError, IndexError):
+        pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()  # Atom
+    except ValueError:
+        return None
+
+
+def fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 ai-news-watch"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        root = ET.fromstring(r.read())
+    items = []
+    for el in root.iter():
+        tag = el.tag.split("}")[-1]
+        if tag not in ("item", "entry"):
+            continue
+        fields = {}
+        for child in el:
+            ctag = child.tag.split("}")[-1]
+            # Article photo: media:content/thumbnail, an image enclosure or <image>
+            if ctag in ("content", "thumbnail") and child.get("url") and child.get("medium", "image") == "image":
+                fields.setdefault("image", child.get("url"))
+            elif ctag == "enclosure" and child.get("url") and child.get("type", "").startswith("image"):
+                fields.setdefault("image", child.get("url"))
+            elif ctag == "image" and (child.text or "").strip().startswith("http"):
+                fields.setdefault("image", child.text.strip())
+            if ctag == "link" and child.get("href"):
+                fields.setdefault("link", child.get("href"))
+            elif child.text:
+                fields.setdefault(ctag, child.text.strip())
+        title = fields.get("title", "")
+        link = fields.get("link") or fields.get("guid") or fields.get("id") or title
+        published = parse_time(fields.get("pubDate") or fields.get("published") or fields.get("updated"))
+        if title:
+            items.append((title, link, published, fields.get("image")))
+    return items
+
+
+def classify(title):
+    if not INCIDENT_RE.search(title) or EXCLUDE_RE.search(title):
+        return []
+    return [name for name, rx in COMPANY_RE.items() if rx.search(title)]
+
+
+def md_escape(text):
+    return re.sub(r"([\[\]*_`])", r"\\\1", text)
+
+
+def gotify(cfg, title, message, priority=10, image=None, link=None):
+    """Sends a Markdown message; image becomes the big picture in the phone notification."""
+    url, token = cfg.get("GOTIFY_URL"), cfg.get("GOTIFY_TOKEN")
+    if not url or not token:
+        log("Gotify not configured, skipping notification")
+        return False
+    notification = {}
+    if image:
+        notification["bigImageUrl"] = image
+    if link:
+        notification["click"] = {"url": link}
+    body = {"title": title, "message": message, "priority": priority,
+            "extras": {"client::display": {"contentType": "text/markdown"},
+                       "client::notification": notification}}
+    req = urllib.request.Request(url.rstrip("/") + "/message", data=json.dumps(body).encode(),
+                                 headers={"X-Gotify-Key": token, "Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=30).read()
+        return True
+    except Exception as e:
+        log("Gotify failed: %s" % e)
+        return False
+
+
+def block_ai(cfg):
+    env = dict(os.environ, PATH=os.environ.get("PATH", "") + ":/usr/local/bin:/usr/bin:/bin")
+    try:
+        r = subprocess.run(cfg["AI_OFF"].split(), env=env, capture_output=True, text=True, timeout=120)
+        out = (r.stdout + r.stderr).strip()
+        return r.returncode == 0, out
+    except Exception as e:
+        return False, str(e)
+
+
+def write_news(state, now, feeds_ok):
+    """Last 24h of matches and last 7 days of blocks, for the status page."""
+    matches = [dict(m, link=k) for k, m in state["matches"].items() if now - m["ts"] <= 86400]
+    matches.sort(key=lambda m: m["ts"], reverse=True)
+    news = {"checked": now, "feeds_ok": feeds_ok, "feeds_total": len(FEEDS),
+            "matches": matches, "blocks": state.get("blocks", [])}
+    try:
+        with open(NEWS_JSON + ".tmp", "w") as f:
+            json.dump(news, f)
+        os.replace(NEWS_JSON + ".tmp", NEWS_JSON)
+    except OSError as e:
+        log("Could not write %s: %s" % (NEWS_JSON, e))
+
+
+def main():
+    dry_run = "--dry-run" in sys.argv
+    cfg = load_config()
+
+    if "--test-alert" in sys.argv:
+        img = "https://cdn.arstechnica.net/wp-content/uploads/2026/10/ai-robot-hand-caution-1152x648.jpg"
+        ok = gotify(cfg, "🤖 AI news watch: test",
+                    "![](%s)\n\n**Test message from ai-news-watch on the Pi.** Real alerts show the article "
+                    "photo and clickable headlines." % img, priority=5, image=img,
+                    link="https://arstechnica.com/security/")
+        sys.exit(0 if ok else 1)
+
+    state = load_state()
+    now = time.time()
+    window = WINDOW_HOURS * 3600
+
+    feeds_ok = 0
+    for source, url in FEEDS.items():
+        try:
+            items = fetch(url)
+            feeds_ok += 1
+        except Exception as e:
+            log("Feed failed: %s: %s" % (source, e))
+            continue
+        for title, link, published, image in items:
+            companies = classify(title)
+            if not companies or link in state["matches"]:
+                continue
+            # Use the publish time if it looks sane, otherwise when we first saw it
+            ts = published if published and published <= now + 3600 else now
+            state["matches"][link] = {"source": source, "title": title, "companies": companies, "ts": ts,
+                                      "image": image}
+            log("Match [%s] %s: %s" % (", ".join(companies), source, title))
+
+    # Forget matches older than two days and blocks older than a week
+    state["matches"] = {k: m for k, m in state["matches"].items() if now - m["ts"] < 2 * 86400}
+    state["blocks"] = [b for b in state.get("blocks", []) if now - b["ts"] < 7 * 86400]
+
+    for company in COMPANIES:
+        recent = [m for m in state["matches"].values()
+                  if company in m["companies"] and now - m["ts"] <= window]
+        sources = sorted({m["source"] for m in recent})
+        if dry_run:
+            if recent:
+                print("%s: %d source(s) in last %dh: %s" % (company, len(sources), WINDOW_HOURS, ", ".join(sources)))
+            continue
+        if len(sources) < (MIN_SOURCES_GENERAL if company == "AI (general)" else MIN_SOURCES):
+            continue
+        if now - state["fired"].get(company, 0) < COOLDOWN_HOURS * 3600:
+            continue
+
+        ok, out = block_ai(cfg)
+        state["fired"][company] = now
+        state["blocks"].append({"company": company, "ts": now, "ok": ok, "sources": sources,
+                                "links": [k for k, m in state["matches"].items() if m in recent]})
+        newest = sorted(((k, m) for k, m in state["matches"].items() if m in recent),
+                        key=lambda km: km[1]["ts"], reverse=True)
+        headlines = "\n".join("- **%s**: [%s](%s)" % (m["source"], md_escape(m["title"]), k) for k, m in newest)
+        image = next((m["image"] for k, m in newest if m.get("image")), None)
+        status = "**AI is now BLOCKED on the network.**" if ok else "**WARNING: ai-off FAILED:**\n\n    " + out
+        log("Fired for %s (%s). ai-off ok=%s %s" % (company, ", ".join(sources), ok, out))
+        gotify(cfg, "🤖 AI breach reported: %s" % company,
+               "%s%s\n\n%d sources within %dh:\n\n%s\n\nTo turn AI back on: log in to the Pi and run `ai-on`."
+               % ("![](%s)\n\n" % image if image else "", status, len(sources), WINDOW_HOURS, headlines),
+               image=image, link=newest[0][0])
+
+    # Warn once a day when no feeds can be reached, so a silent failure gets noticed
+    if feeds_ok == 0 and not dry_run and now - state.get("feeds_down_warned", 0) > 86400:
+        state["feeds_down_warned"] = now
+        gotify(cfg, "AI news watch: no feeds reachable",
+               "None of the news feeds could be fetched. Check %s on the Pi." % LOG, priority=5)
+
+    if not dry_run:
+        save_state(state)
+        write_news(state, now, feeds_ok)
+
+
+if __name__ == "__main__":
+    main()

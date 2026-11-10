@@ -1,0 +1,12 @@
+# Install as /etc/cron.d/ai-switch. Replace "pi" with the user that owns ~/.config/ai-switch.
+SHELL=/bin/sh
+PATH=/usr/local/bin:/usr/bin:/bin
+
+# Status for the read-only page (every minute)
+* * * * *   pi  /usr/local/bin/ai-status > /var/lib/ai-switch-status/status.txt.tmp 2>&1 && mv /var/lib/ai-switch-status/status.txt.tmp /var/lib/ai-switch-status/status.txt && chmod 644 /var/lib/ai-switch-status/status.txt
+# Block after IDLE_HOURS without real AI traffic, or MAX_ON_HOURS after the last ai-on
+*/5 * * * * pi  /usr/local/bin/ai-idle >> /home/pi/.config/ai-switch/idle.log 2>&1
+# Refresh domain lists and IP ranges, re-apply blocks (also repairs the firewall after a router reboot)
+15 4 * * *  pi  /usr/local/bin/ai-update >> /home/pi/.config/ai-switch/update.log 2>&1
+# Breach watch on security news feeds
+*/15 * * * * pi /usr/local/bin/ai-news-watch > /dev/null 2>&1

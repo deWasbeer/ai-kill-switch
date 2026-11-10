@@ -1,0 +1,12 @@
+# Keeps the AI switch and news watch logs small. Install as /etc/logrotate.d/ai-switch
+/home/pi/.config/ai-switch/*.log /home/pi/.local/state/ai-news-watch/log.txt {
+    su pi pi
+    weekly
+    maxsize 1M
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
