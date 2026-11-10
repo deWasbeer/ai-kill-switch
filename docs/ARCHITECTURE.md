@@ -28,6 +28,10 @@ one of the machines in the network, and that it must not be able to undo the swi
 
 ## Reference setup (OpenWrt + AdGuard Home)
 
+![Architecture](architecture.svg)
+
+The same in Mermaid:
+
 ```mermaid
 flowchart LR
   subgraph LAN
@@ -63,7 +67,7 @@ flowchart LR
 | `ai-update` | switch user | daily 04:15 | Refreshes published IP ranges, learns new domains from the DNS query log, tracks route changes, lists suspicious domains for review. |
 | `ai-idle` | switch user | every 5 min | Blocks everything when no real AI traffic was seen for `IDLE_HOURS`, or `MAX_ON_HOURS` after the last `ai-on`. |
 | `bin/ai-news-watch` | switch user | every 15 min | Reads 9 security RSS feeds and blocks AI when enough of them report a breach at one company. Sends a Gotify alert. |
-| `bin/ai-status-http` | systemd `DynamicUser` | always | Read-only page on :8099. Reads only `/var/lib/ai-switch-status/`. |
+| `bin/ai-status-http` | systemd `DynamicUser` | always | Read-only page on :8099. Reads only `/var/lib/ai-switch-status/`. See [the screenshot](status-page.png). |
 | `etc/ai-switch.logrotate` | root | weekly | Keeps logs small. |
 
 ### State on disk (`~/.config/ai-switch/`)

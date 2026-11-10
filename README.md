@@ -13,6 +13,12 @@ may be running somewhere on the network and makes sure it can't undo the switch.
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design, the threat model, and how to run
 it with **Pi-hole** instead of AdGuard Home.
 
+![Architecture](docs/architecture.svg)
+
+The read-only status page (`ai-status-http`, port 8099), shown here with demo data:
+
+![Status page](docs/status-page.png)
+
 ## Reference setup
 
 - OpenWrt router running AdGuard Home (DNS on :53, UI on :8080)
